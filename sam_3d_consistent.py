@@ -6,10 +6,9 @@ Given a Blender scene with multiple camera views and object masks,
 this script finds a 3D voxel shape and per-view poses such that
 projecting the shape to each view matches the corresponding mask.
 
-Architecture (Geometry Model — see diagram):
-    Image + Mask → Image Encoder (DINOv2, frozen) → Image Tokens
-    Layout Tokens (learnable, shared) ─┬→ Mixture of Transformers* ─→ Layout Decoder → R, T, S
-    Shape Tokens  (learnable, shared) ─┘                            → Shape Decoder  → Voxel (64³)
+This script loads a pre-trained SAM3D pipeline and finetunes the
+latent tokens (shape and layout) to maximize consistency with the
+provided multi-view masks.
 
 Training loop:
     1. Select 2 camera views (i, j)
@@ -18,13 +17,7 @@ Training loop:
     4. Compute IoU loss between rendered_mask_j and GT mask_j
     5. Backpropagate to update layout tokens and shape logits
 
-Usage (from-scratch):
-    python sam_3d_consistent.py \\
-        --blender_dir /path/to/blender/scene \\
-        --mask_pt /path/to/masks.pt \\
-        --num_steps 5000
-
-Usage (finetuning with SAM3D checkpoint):
+Usage:
     python sam_3d_consistent.py \\
         --config_path checkpoints/hf/pipeline.yaml \\
         --blender_dir /path/to/blender/scene \\
@@ -41,6 +34,7 @@ import argparse
 from pathlib import Path
 
 import torch
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -324,11 +318,10 @@ class SAM3DFinetuningWrapper(nn.Module):
     All gradients flow into the tokens (and optionally into the pipeline if not frozen).
     """
 
-    def __init__(self, pipeline, freeze_backbone: bool = True, device=None, init_data: dict | None = None, use_explicit_pose: bool = True):
+    def __init__(self, pipeline, freeze_backbone: bool = True, device=None, init_data: dict | None = None):
         super().__init__()
         self.pipeline = pipeline
         self.device = device or next(pipeline.models["ss_generator"].parameters()).device
-        self.use_explicit_pose = use_explicit_pose
 
         # Build learnable token dict from generator's latent_mapping (output shapes)
         ss_generator = pipeline.models["ss_generator"]
@@ -429,18 +422,15 @@ class SAM3DFinetuningWrapper(nn.Module):
                 init_val = torch.randn(1, L, C, device=self.device, dtype=torch.float32) * 0.02
             self.learnable_tokens[name] = nn.Parameter(init_val)
 
-        if self.use_explicit_pose:
-            # Explicit parameters for Object World Pose
-            # Initialize close to Identity (R=I, T=0, S=1)
-            self.explicit_rot_6d = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=self.device))
-            self.explicit_trans = nn.Parameter(torch.zeros(3, device=self.device))
-            self.explicit_scale_log = nn.Parameter(torch.zeros(3, device=self.device)) # exp(0)=1
-            
-            # We still need pose_decoder for type compatibility if user wants to unfreeze? 
-            # But we won't use it in forward.
-            self.pose_decoder = pipeline.pose_decoder
-        else:
-            self.pose_decoder = pipeline.pose_decoder
+        # Explicit parameters for Object World Pose
+        # Initialize close to Identity (R=I, T=0, S=1)
+        self.explicit_rot_6d = nn.Parameter(torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], device=self.device))
+        self.explicit_trans = nn.Parameter(torch.zeros(3, device=self.device))
+        self.explicit_scale_log = nn.Parameter(torch.zeros(3, device=self.device)) # exp(0)=1
+        
+        # We still need pose_decoder for type compatibility if user wants to unfreeze? 
+        # But we won't use it in forward.
+        self.pose_decoder = pipeline.pose_decoder
 
         self.ss_decoder = pipeline.models["ss_decoder"]
 
@@ -452,10 +442,9 @@ class SAM3DFinetuningWrapper(nn.Module):
                 for p in pipeline.condition_embedders["ss_condition_embedder"].parameters():
                     p.requires_grad = False
             # If using explicit pose, freeze pose_decoder too (it's unused anyway)
-            if self.use_explicit_pose:
-                if isinstance(self.pose_decoder, nn.Module):
-                    for p in self.pose_decoder.parameters():
-                        p.requires_grad = False
+            if isinstance(self.pose_decoder, nn.Module):
+                for p in self.pose_decoder.parameters():
+                    p.requires_grad = False
 
     def forward(self, image: torch.Tensor, mask: torch.Tensor | None = None):
         """
@@ -485,264 +474,18 @@ class SAM3DFinetuningWrapper(nn.Module):
         voxel_logits = self.ss_decoder(ss_input)  # (B, 1, 64, 64, 64)
 
         # Layout → R, T, S
-        if self.use_explicit_pose:
-            # Use explicit World Pose parameters (broadcast to batch)
-            R = rotation_6d_to_matrix(self.explicit_rot_6d).unsqueeze(0).expand(B, -1, -1)
-            T = self.explicit_trans.unsqueeze(0).expand(B, -1)
-            S = torch.exp(self.explicit_scale_log).unsqueeze(0).expand(B, -1)
-        else:
-            # Use pose decoder
-            pose_dict = self.pose_decoder(output_dict)
-            from pytorch3d.transforms import quaternion_to_matrix
-
-            quat = pose_dict["rotation"]  # (B, 4) or (4,)
-            trans = pose_dict["translation"]  # (B, 3) or (3,)
-            scale = pose_dict["scale"]  # (B, 3) or (1, 3)
-            if quat.dim() == 1:
-                quat = quat.unsqueeze(0)
-            if trans.dim() == 1:
-                trans = trans.unsqueeze(0)
-            if scale.dim() == 1:
-                scale = scale.unsqueeze(0)
-            R = quaternion_to_matrix(quat)  # (B, 3, 3)
-            T = trans
-            S = scale.expand(R.shape[0], 3)
+        # Use explicit World Pose parameters (broadcast to batch)
+        R = rotation_6d_to_matrix(self.explicit_rot_6d).unsqueeze(0).expand(B, -1, -1)
+        T = self.explicit_trans.unsqueeze(0).expand(B, -1)
+        S = torch.exp(self.explicit_scale_log).unsqueeze(0).expand(B, -1)
 
         return voxel_logits, R, T, S
 
 
 # ============================================================================
-#  Model Components (from-scratch geometry model)
+#  Model Components (from-scratch geometry model) - Removed unused classes
 # ============================================================================
 
-class FrozenDINOv2(nn.Module):
-    """DINOv2 ViT-B/14 image encoder, frozen for feature extraction."""
-
-    def __init__(
-        self,
-        model_name: str = "dinov2_vitb14",
-        input_size: int = 224,
-    ):
-        super().__init__()
-        import warnings
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.backbone = torch.hub.load(
-                "facebookresearch/dinov2", model_name, verbose=False
-            )
-        self.embed_dim: int = self.backbone.embed_dim  # 768 for ViT-B/14
-        self.input_size = input_size
-
-        self.register_buffer(
-            "mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        )
-        self.register_buffer(
-            "std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        )
-
-        # Freeze everything
-        self.requires_grad_(False)
-        self.eval()
-
-    def train(self, mode: bool = True):
-        return super().train(False)  # always eval
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, 3, H, W) RGB in [0, 1].
-        Returns:
-            (B, 1 + num_patches, 768) CLS + patch tokens.
-        """
-        x = F.interpolate(
-            x, size=(self.input_size, self.input_size),
-            mode="bilinear", align_corners=False,
-        )
-        x = (x - self.mean) / self.std
-        out = self.backbone.forward_features(x)
-        tokens = torch.cat(
-            [out["x_norm_clstoken"].unsqueeze(1), out["x_norm_patchtokens"]], dim=1
-        )
-        return tokens
-
-
-class CrossAttentionBlock(nn.Module):
-    """Pre-norm Transformer block: self-attn → cross-attn (to image) → FFN."""
-
-    def __init__(
-        self,
-        d_model: int,
-        n_heads: int,
-        d_context: int,
-        mlp_ratio: float = 4.0,
-    ):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm_ctx = nn.LayerNorm(d_context)
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True,
-            kdim=d_context, vdim=d_context,
-        )
-        self.norm3 = nn.LayerNorm(d_model)
-        hidden = int(d_model * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden), nn.GELU(), nn.Linear(hidden, d_model)
-        )
-
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        h = self.norm1(x)
-        x = x + self.self_attn(h, h, h, need_weights=False)[0]
-        h = self.norm2(x)
-        ctx = self.norm_ctx(context)
-        x = x + self.cross_attn(h, ctx, ctx, need_weights=False)[0]
-        x = x + self.mlp(self.norm3(x))
-        return x
-
-
-class LayoutDecoder(nn.Module):
-    """Pool layout tokens → rotation (6D→3×3), translation (3), scale (3)."""
-
-    def __init__(self, d_model: int):
-        super().__init__()
-        hidden = d_model * 2
-        self.pool_proj = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-        )
-        self.rot_head = nn.Linear(hidden, 6)
-        self.trans_head = nn.Linear(hidden, 3)
-        self.scale_head = nn.Linear(hidden, 3)
-
-        # Initialise to identity-like transform
-        nn.init.zeros_(self.rot_head.weight)
-        self.rot_head.bias.data.copy_(
-            torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
-        )
-        nn.init.zeros_(self.trans_head.weight)
-        # Place the object in front of the camera to avoid near-plane clipping
-        self.trans_head.bias.data.copy_(torch.tensor([0.0, 0.0, 2.0]))
-        nn.init.zeros_(self.scale_head.weight)
-        nn.init.zeros_(self.scale_head.bias)  # exp(0) = 1
-
-    def forward(self, tokens: torch.Tensor):
-        """
-        Args:
-            tokens: (B, N, d_model)
-        Returns:
-            R (B, 3, 3), T (B, 3), S (B, 3)
-        """
-        pooled = tokens.mean(dim=1)
-        h = self.pool_proj(pooled)
-        R = rotation_6d_to_matrix(self.rot_head(h))
-        T = self.trans_head(h)
-        S = torch.exp(self.scale_head(h).clamp(-4, 4))  # positive, bounded
-        return R, T, S
-
-
-# ============================================================================
-#  Geometry Model
-# ============================================================================
-
-class GeometryModel(nn.Module):
-    """
-    Full Geometry Model following the architecture diagram.
-
-    Learnable parameters optimised during training:
-        * ``layout_tokens``  – shared across all views, processed through
-          Transformer blocks with cross-attention to image features, then
-          decoded to per-view Rotation / Translation / Scale.
-        * ``shape_logits``   – a shared 3D voxel grid (D³) of occupancy
-          logits, directly optimised (the "shape token" in its simplest
-          form).  Sigmoid is applied at render time.
-
-    To upgrade to the full MoT + Shape Decoder architecture, replace
-    ``shape_logits`` with a ``shape_tokens`` parameter, add MoT blocks
-    that process both token sets jointly, and add a 3D-CNN shape decoder
-    (e.g. ``SparseStructureDecoder``).
-    """
-
-    def __init__(
-        self,
-        d_model: int = 384,
-        n_heads: int = 8,
-        n_blocks: int = 4,
-        n_layout_tokens: int = 8,
-        voxel_resolution: int = 64,
-        init_voxel_radius: float = 0.25,
-    ):
-        super().__init__()
-
-        # ---------- Image encoder (frozen) ----------
-        self.image_encoder = FrozenDINOv2()
-        d_context = self.image_encoder.embed_dim  # 768
-
-        # ---------- Layout branch ----------
-        self.layout_tokens = nn.Parameter(
-            torch.randn(1, n_layout_tokens, d_model) * 0.02
-        )
-        self.layout_blocks = nn.ModuleList(
-            [CrossAttentionBlock(d_model, n_heads, d_context) for _ in range(n_blocks)]
-        )
-        self.layout_decoder = LayoutDecoder(d_model)
-
-        # ---------- Shape branch (direct voxel logits) ----------
-        self.voxel_resolution = voxel_resolution
-        self.shape_logits = nn.Parameter(
-            self._init_sphere(voxel_resolution, init_voxel_radius)
-        )
-
-    # ---- initialisation helpers ----
-
-    @staticmethod
-    def _init_sphere(res: int, radius: float) -> torch.Tensor:
-        """Create a soft sphere as initial voxel logits."""
-        g = torch.linspace(-0.5, 0.5, res)
-        gz, gy, gx = torch.meshgrid(g, g, g, indexing="ij")
-        dist = torch.sqrt(gx ** 2 + gy ** 2 + gz ** 2)
-        logits = -(dist - radius) * 10.0  # positive inside
-        return logits.unsqueeze(0).unsqueeze(0)  # (1, 1, D, D, D)
-
-    # ---- forward ----
-
-    def forward(self, image: torch.Tensor, mask: torch.Tensor | None = None):
-        """
-        Args:
-            image: (B, 3, H, W) RGB in [0, 1].
-            mask:  (B, 1, H, W) object mask (optional, for masked encoding).
-        Returns:
-            voxel_logits: (B, 1, D, D, D) raw occupancy logits.
-            R: (B, 3, 3), T: (B, 3), S: (B, 3) per-view layout.
-        """
-        B = image.shape[0]
-
-        # Optionally mask the image (zero background)
-        if mask is not None:
-            encoder_input = image * mask + 0.5 * (1 - mask)  # gray bg
-        else:
-            encoder_input = image
-
-        # Image features (frozen, detached)
-        with torch.no_grad():
-            image_features = self.image_encoder(encoder_input)
-        image_features = image_features.detach()
-
-        # Layout tokens → transformer → decoder
-        layout_h = self.layout_tokens.expand(B, -1, -1)
-        for block in self.layout_blocks:
-            layout_h = block(layout_h, image_features)
-        R, T, S = self.layout_decoder(layout_h)
-
-        # Shape: shared voxel logits (view-independent)
-        voxel_logits = self.shape_logits.expand(B, -1, -1, -1, -1)
-
-        return voxel_logits, R, T, S
 
 
 # ============================================================================
@@ -849,7 +592,7 @@ def render_voxel_to_mask(
 # ============================================================================
 
 def compute_step_losses(
-    model: GeometryModel,
+    model: nn.Module,
     data_i: dict,
     data_j: dict,
     K: torch.Tensor,
@@ -859,7 +602,6 @@ def compute_step_losses(
     near: float,
     far: float,
     device: torch.device,
-    is_view_dependent: bool = True,
 ):
     """Compute cross-view and self-consistency losses for one (i, j) pair.
 
@@ -880,12 +622,8 @@ def compute_step_losses(
 
     # ---- Cross-view loss: project to view_j ----
     w2c_j = torch.inverse(c2w_j)
-    if is_view_dependent:
-        # layout_mat is relative pose to view i (object → camera_i)
-        obj_to_cam_j = w2c_j @ c2w_i @ layout_mat
-    else:
-        # layout_mat is world pose (object → world)
-        obj_to_cam_j = w2c_j @ layout_mat
+    # layout_mat is world pose (object → world)
+    obj_to_cam_j = w2c_j @ layout_mat
 
     rendered_j = render_voxel_to_mask(
         voxel_logits, obj_to_cam_j, K, render_H, render_W, n_depth, near, far
@@ -904,11 +642,8 @@ def compute_step_losses(
     )
 
     # ---- Self-consistency loss: project back to view_i ----
-    if is_view_dependent:
-        obj_to_cam_i = layout_mat  # identity relative transform
-    else:
-        w2c_i = torch.inverse(c2w_i)
-        obj_to_cam_i = w2c_i @ layout_mat
+    w2c_i = torch.inverse(c2w_i)
+    obj_to_cam_i = w2c_i @ layout_mat
 
     rendered_i = render_voxel_to_mask(
         voxel_logits, obj_to_cam_i, K, render_H, render_W, n_depth, near, far
@@ -948,72 +683,39 @@ def train(args):
     N_views = len(dataset)
     assert N_views >= 2, "Need at least 2 views for cross-view training"
 
-    # ---- Model (from checkpoint or from scratch) ----
-    use_sam3d_checkpoint = getattr(args, "config_path", None) not in (None, "")
-    is_view_dependent = not use_sam3d_checkpoint
+    # ---- Model (finetuning) ----
+    if not args.config_path:
+        raise ValueError("--config_path must be provided")
 
-    if use_sam3d_checkpoint:
-        print(f"Loading SAM3D pipeline from {args.config_path} (finetuning) …")
-        pipeline = load_sam3d_pipeline(args.config_path, compile_model=False)
-        pipeline.models.to(device)
-        if getattr(pipeline, "condition_embedders", None):
-            for emb in pipeline.condition_embedders.values():
-                if emb is not None:
-                    emb.to(device)
-        model = SAM3DFinetuningWrapper(
-            pipeline,
-            freeze_backbone=args.freeze_backbone,
-            device=device,
-            init_data=dataset[0],
-            use_explicit_pose=True, # Always use explicit pose for consistency optimization
-        )
-        model.to(device)
-        
-        # Collect params
-        token_params = list(model.learnable_tokens.parameters())
-        if model.use_explicit_pose:
-             token_params.extend([
-                 model.explicit_rot_6d,
-                 model.explicit_trans,
-                 model.explicit_scale_log
-             ])
-        token_set = {p for p in token_params}
-        weight_params = [p for p in model.parameters() if p.requires_grad and p not in token_set]
-    else:
-        print("Building from-scratch GeometryModel …")
-        model = GeometryModel(
-            d_model=args.d_model,
-            n_heads=args.n_heads,
-            n_blocks=args.n_blocks,
-            n_layout_tokens=args.n_layout_tokens,
-            voxel_resolution=args.voxel_res,
-            init_voxel_radius=args.init_radius,
-        ).to(device)
-        if hasattr(model, "shape_logits"):
-            token_ids = {id(model.layout_tokens), id(model.shape_logits)}
-            token_params = [p for p in model.parameters() if id(p) in token_ids]
-            weight_params = [
-                p for p in model.parameters()
-                if p.requires_grad and id(p) not in token_ids
-            ]
-        elif hasattr(model, "learnable_tokens"):
-             # For finetuning wrapper
-            token_params = list(model.learnable_tokens.parameters())
-            # Include explicit pose params in token_params (high LR)
-            if model.use_explicit_pose:
-                 token_params.extend([
-                     model.explicit_rot_6d,
-                     model.explicit_trans,
-                     model.explicit_scale_log
-                 ])
-            token_set = set(token_params)
-            weight_params = [p for p in model.parameters() if p.requires_grad and p not in token_set]
-
+    print(f"Loading SAM3D pipeline from {args.config_path} (finetuning) …")
+    pipeline = load_sam3d_pipeline(args.config_path, compile_model=False)
+    pipeline.models.to(device)
+    if getattr(pipeline, "condition_embedders", None):
+        for emb in pipeline.condition_embedders.values():
+            if emb is not None:
+                emb.to(device)
+    model = SAM3DFinetuningWrapper(
+        pipeline,
+        freeze_backbone=args.freeze_backbone,
+        device=device,
+        init_data=dataset[0],
+    )
+    model.to(device)
+    
+    # Collect params
+    token_params = list(model.learnable_tokens.parameters())
+    token_params.extend([
+        model.explicit_rot_6d,
+        model.explicit_trans,
+        model.explicit_scale_log
+    ])
+    token_set = {p for p in token_params}
+    weight_params = [p for p in model.parameters() if p.requires_grad and p not in token_set]
 
     total_p = sum(p.numel() for p in model.parameters())
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters — total: {total_p:,}  trainable: {train_p:,}")
-    print(f"Training mode: {'View-Dependent Pose (Scratch)' if is_view_dependent else 'World Pose (Shared Tokens)'}")
+    print(f"Training mode: World Pose (Shared Tokens)")
 
     # ---- Optimiser (separate LR for tokens vs. model weights) ----
     opt_groups = [{"params": token_params, "lr": args.lr_tokens}]
@@ -1029,6 +731,15 @@ def train(args):
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    # Initialize TensorBoard writer
+    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "logs"))
+
+    # Running averages
+    loss_avg = 0.0
+    iou_cross_avg = 0.0
+    iou_self_avg = 0.0
+    alpha = 0.05
+
     for step in range(1, args.num_steps + 1):
         model.train()
 
@@ -1042,7 +753,6 @@ def train(args):
             render_H=args.render_size, render_W=args.render_size,
             n_depth=args.n_depth, near=args.near, far=args.far,
             device=device,
-            is_view_dependent=is_view_dependent,
         )
 
         # Weighted total loss
@@ -1059,23 +769,32 @@ def train(args):
         optimizer.step()
         scheduler.step()
 
+        # Update running averages
+        if step == 1:
+            loss_avg = loss.item()
+            iou_cross_avg = losses['iou_cross'].item()
+            iou_self_avg = losses['iou_self'].item()
+        else:
+            loss_avg = (1 - alpha) * loss_avg + alpha * loss.item()
+            iou_cross_avg = (1 - alpha) * iou_cross_avg + alpha * losses['iou_cross'].item()
+            iou_self_avg = (1 - alpha) * iou_self_avg + alpha * losses['iou_self'].item()
+
         # ---- Logging ----
         if step % args.log_every == 0 or step == 1:
-            occ_str = ""
-            with torch.no_grad():
-                if hasattr(model, "shape_logits"):
-                    occ_frac = (
-                        (torch.sigmoid(model.shape_logits) > 0.5).float().mean().item()
-                    )
-                    occ_str = f"  occ={occ_frac:.4f}"
             print(
                 f"[{step:>6d}/{args.num_steps}]  "
-                f"loss={loss.item():.4f}  "
-                f"IoU_cross={losses['iou_cross'].item():.4f}  "
-                f"IoU_self={losses['iou_self'].item():.4f}"
-                f"{occ_str}  "
+                f"loss={loss_avg:.4f}  "
+                f"IoU_cross={iou_cross_avg:.4f}  "
+                f"IoU_self={iou_self_avg:.4f}  "
                 f"views={data_i['name']}→{data_j['name']}"
             )
+            
+            # TensorBoard logging
+            writer.add_scalar("Loss/total", loss_avg, step)
+            writer.add_scalar("IoU/cross", iou_cross_avg, step)
+            writer.add_scalar("IoU/self", iou_self_avg, step)
+            writer.add_scalar("Loss/bce_cross", losses['bce_cross'].item(), step)
+            writer.add_scalar("Loss/bce_self", losses['bce_self'].item(), step)
 
         # ---- Checkpoints ----
         if step % args.save_every == 0 or step == args.num_steps:
@@ -1085,28 +804,20 @@ def train(args):
                 "optimizer_state_dict": optimizer.state_dict(),
                 "args": vars(args),
             }
-            if hasattr(model, "shape_logits"):
-                ckpt["shape_logits"] = model.shape_logits.data.cpu()
-                ckpt["layout_tokens"] = model.layout_tokens.data.cpu()
-            elif hasattr(model, "learnable_tokens"):
-                ckpt["learnable_tokens"] = {k: v.data.cpu() for k, v in model.learnable_tokens.items()}
-                if model.use_explicit_pose:
-                    ckpt["explicit_pose"] = {
-                        "rot": model.explicit_rot_6d.data.cpu(),
-                        "trans": model.explicit_trans.data.cpu(),
-                        "scale": model.explicit_scale_log.data.cpu()
-                    }
+            ckpt["learnable_tokens"] = {k: v.data.cpu() for k, v in model.learnable_tokens.items()}
+            ckpt["explicit_pose"] = {
+                "rot": model.explicit_rot_6d.data.cpu(),
+                "trans": model.explicit_trans.data.cpu(),
+                "scale": model.explicit_scale_log.data.cpu()
+            }
             path = os.path.join(args.output_dir, f"checkpoint_{step:06d}.pt")
             torch.save(ckpt, path)
             print(f"  → saved {path}")
 
             # Save voxel coordinates for quick inspection
             with torch.no_grad():
-                if hasattr(model, "shape_logits"):
-                    occ = torch.sigmoid(model.shape_logits.detach()) > 0.5
-                else:
-                    voxel_logits, _, _, _ = model(None, None)
-                    occ = torch.sigmoid(voxel_logits.detach()) > 0.5
+                voxel_logits, _, _, _ = model(None, None)
+                occ = torch.sigmoid(voxel_logits.detach()) > 0.5
                 if occ is not None:
                     coords = torch.nonzero(occ.squeeze(), as_tuple=False).cpu()
                     torch.save(
@@ -1116,7 +827,7 @@ def train(args):
 
         # ---- Optional: save visualisation ----
         if args.vis_every > 0 and (step % args.vis_every == 0 or step == 1):
-            _save_vis(
+            vis_grid = _save_vis(
                 losses["rendered_j"],
                 data_j["mask"],
                 losses["rendered_i"],
@@ -1127,6 +838,8 @@ def train(args):
                 data_j["name"],
                 args.render_size,
             )
+            if vis_grid is not None:
+                writer.add_image("Visualization", vis_grid, step, dataformats='HW')
 
     print("\n✓ Training complete.")
 
@@ -1160,8 +873,10 @@ def _save_vis(
         grid = np.concatenate([top, bot], axis=0)
         vis_path = os.path.join(output_dir, f"vis_{step:06d}.png")
         Image.fromarray(grid).save(vis_path)
+        return grid
     except Exception as e:
         print(f"  (vis save failed: {e})")
+        return None
 
 
 # ============================================================================
@@ -1188,16 +903,6 @@ def main():
                     help="Freeze SS generator/decoder/condition embedder when finetuning (only train tokens).")
     p.add_argument("--no_freeze_backbone", action="store_false", dest="freeze_backbone",
                     help="Finetune full pipeline (tokens + backbone) with small LR.")
-
-    # Model (used only when config_path is not set)
-    p.add_argument("--d_model", type=int, default=384)
-    p.add_argument("--n_heads", type=int, default=8)
-    p.add_argument("--n_blocks", type=int, default=4)
-    p.add_argument("--n_layout_tokens", type=int, default=8)
-    p.add_argument("--voxel_res", type=int, default=64,
-                    help="Voxel grid resolution (D³)")
-    p.add_argument("--init_radius", type=float, default=0.25,
-                    help="Initial sphere radius for shape logits")
 
     # Rendering
     p.add_argument("--render_size", type=int, default=128,
