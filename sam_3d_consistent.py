@@ -483,12 +483,6 @@ class SAM3DFinetuningWrapper(nn.Module):
 
 
 # ============================================================================
-#  Model Components (from-scratch geometry model) - Removed unused classes
-# ============================================================================
-
-
-
-# ============================================================================
 #  Differentiable Voxel Rendering
 # ============================================================================
 
@@ -848,18 +842,9 @@ def _save_vis(
     rendered_j, gt_mask_j, rendered_i, gt_mask_i,
     step, output_dir, name_i, name_j, render_size,
 ):
-    """Save a simple 2×2 grid: rendered-i | GT-i | rendered-j | GT-j."""
+    """Save a 1×4 grid: mask_i | mask_j | rendered_i (self) | rendered_j (cross)."""
     try:
-        rj = (rendered_j[0, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        gj = gt_mask_j.cpu().numpy()
-        if gj.ndim > 2:
-            gj = gj.squeeze()
-        gj_rs = np.array(
-            Image.fromarray((gj * 255).astype(np.uint8)).resize(
-                (render_size, render_size), Image.NEAREST
-            )
-        )
-        ri = (rendered_i[0, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        # Prepare mask_i
         gi = gt_mask_i.cpu().numpy()
         if gi.ndim > 2:
             gi = gi.squeeze()
@@ -868,9 +853,25 @@ def _save_vis(
                 (render_size, render_size), Image.NEAREST
             )
         )
-        top = np.concatenate([ri, gi_rs], axis=1)
-        bot = np.concatenate([rj, gj_rs], axis=1)
-        grid = np.concatenate([top, bot], axis=0)
+        
+        # Prepare mask_j
+        gj = gt_mask_j.cpu().numpy()
+        if gj.ndim > 2:
+            gj = gj.squeeze()
+        gj_rs = np.array(
+            Image.fromarray((gj * 255).astype(np.uint8)).resize(
+                (render_size, render_size), Image.NEAREST
+            )
+        )
+        
+        # Prepare rendered_i (self-projected)
+        ri = (rendered_i[0, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        
+        # Prepare rendered_j (cross-projected)
+        rj = (rendered_j[0, 0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        
+        # Create 1×4 grid
+        grid = np.concatenate([gi_rs, gj_rs, ri, rj], axis=1)
         vis_path = os.path.join(output_dir, f"vis_{step:06d}.png")
         Image.fromarray(grid).save(vis_path)
         return grid
